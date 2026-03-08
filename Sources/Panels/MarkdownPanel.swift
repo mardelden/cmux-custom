@@ -45,8 +45,8 @@ final class MarkdownPanel: Panel, ObservableObject {
 
     // MARK: - Init
 
-    init(workspaceId: UUID, filePath: String) {
-        self.id = UUID()
+    init(workspaceId: UUID, filePath: String, restoredId: UUID? = nil) {
+        self.id = restoredId ?? UUID()
         self.workspaceId = workspaceId
         self.filePath = filePath
         self.displayTitle = (filePath as NSString).lastPathComponent

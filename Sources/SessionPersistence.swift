@@ -3,7 +3,7 @@ import Foundation
 import Bonsplit
 
 enum SessionSnapshotSchema {
-    static let currentVersion = 1
+    static let currentVersion = 2
 }
 
 enum SessionPersistencePolicy {
@@ -327,6 +327,7 @@ indirect enum SessionWorkspaceLayoutSnapshot: Codable, Sendable {
 }
 
 struct SessionWorkspaceSnapshot: Codable, Sendable {
+    var id: UUID?
     var processTitle: String
     var customTitle: String?
     var customColor: String?
@@ -365,7 +366,7 @@ enum SessionPersistenceStore {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
         let decoder = JSONDecoder()
         guard let snapshot = try? decoder.decode(AppSessionSnapshot.self, from: data) else { return nil }
-        guard snapshot.version == SessionSnapshotSchema.currentVersion else { return nil }
+        guard snapshot.version >= 1 && snapshot.version <= SessionSnapshotSchema.currentVersion else { return nil }
         guard !snapshot.windows.isEmpty else { return nil }
         return snapshot
     }

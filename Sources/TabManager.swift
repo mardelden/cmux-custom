@@ -3800,7 +3800,8 @@ extension TabManager {
             let workspace = Workspace(
                 title: workspaceSnapshot.processTitle,
                 workingDirectory: workspaceSnapshot.currentDirectory,
-                portOrdinal: ordinal
+                portOrdinal: ordinal,
+                restoredId: workspaceSnapshot.id
             )
             workspace.restoreSessionSnapshot(workspaceSnapshot)
             wireClosedBrowserTracking(for: workspace)
