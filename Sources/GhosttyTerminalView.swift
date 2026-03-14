@@ -206,6 +206,51 @@ enum GhosttyDefaultBackgroundUpdateScope: Int {
     }
 }
 
+/// Coalesces callbacks from any thread, dispatching only the latest value to main.
+/// Unlike `NotificationBurstCoalescer` (which requires calling from main thread),
+/// this can be called from the Ghostty IO thread. It uses an atomic pending flag
+/// to ensure at most one main-thread dispatch is in-flight at a time, collapsing
+/// thousands of rapid-fire callbacks into one-per-run-loop-cycle.
+final class ThreadSafeCallbackCoalescer<T> {
+    private var _pendingValue: T?
+    private var _isDispatchPending = false
+    private var _lock = os_unfair_lock()
+    private let handler: (T) -> Void
+
+    init(handler: @escaping (T) -> Void) {
+        self.handler = handler
+    }
+
+    /// Store a new value and schedule a main-thread flush if not already pending.
+    func signal(_ value: T) {
+        os_unfair_lock_lock(&_lock)
+        _pendingValue = value
+        let shouldDispatch = !_isDispatchPending
+        if shouldDispatch {
+            _isDispatchPending = true
+        }
+        os_unfair_lock_unlock(&_lock)
+
+        if shouldDispatch {
+            DispatchQueue.main.async { [self] in
+                self.flush()
+            }
+        }
+    }
+
+    private func flush() {
+        os_unfair_lock_lock(&_lock)
+        let value = _pendingValue
+        _pendingValue = nil
+        _isDispatchPending = false
+        os_unfair_lock_unlock(&_lock)
+
+        if let value = value {
+            handler(value)
+        }
+    }
+}
+
 /// Coalesces Ghostty background notifications so consumers only observe
 /// the latest runtime background for a burst of updates.
 final class GhosttyDefaultBackgroundNotificationDispatcher {
@@ -640,6 +685,36 @@ class GhosttyApp {
     private(set) var config: ghostty_config_t?
     private(set) var defaultBackgroundColor: NSColor = .windowBackgroundColor
     private(set) var defaultBackgroundOpacity: Double = 1.0
+
+    /// Coalesces wakeup callbacks so only one `tick()` dispatch is enqueued at a time.
+    /// The IO thread sets this to `true` before enqueuing; the main thread resets it
+    /// after `tick()` completes. This collapses thousands of wakeups (one per 1024-byte
+    /// PTY read) into one-per-run-loop-cycle during output floods.
+    private var _isTickPending = false
+    private var _isTickPendingLock = os_unfair_lock()
+
+    var isTickPending: Bool {
+        get {
+            os_unfair_lock_lock(&_isTickPendingLock)
+            let value = _isTickPending
+            os_unfair_lock_unlock(&_isTickPendingLock)
+            return value
+        }
+        set {
+            os_unfair_lock_lock(&_isTickPendingLock)
+            _isTickPending = newValue
+            os_unfair_lock_unlock(&_isTickPendingLock)
+        }
+    }
+
+    /// Atomically sets `isTickPending` to `true` and returns the previous value.
+    func setTickPendingIfNeeded() -> Bool {
+        os_unfair_lock_lock(&_isTickPendingLock)
+        let wasPending = _isTickPending
+        _isTickPending = true
+        os_unfair_lock_unlock(&_isTickPendingLock)
+        return wasPending
+    }
     private static func resolveBackgroundLogURL(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {
@@ -770,9 +845,65 @@ class GhosttyApp {
 
     private init() {
         initializeGhostty()
+        #if DEBUG
+        startStallDetector()
+        #endif
     }
 
     #if DEBUG
+    private var stallDetectorTimer: DispatchSourceTimer?
+    private var lastSampleTime: CFTimeInterval = 0
+
+    /// Background-thread watchdog that pings the main thread every 500ms.
+    /// Logs a warning when the main thread doesn't respond within 200ms,
+    /// catching freezes inside Ghostty C/Zig code or AppKit/Metal rendering
+    /// that our specific instrumentation points don't cover.
+    private func startStallDetector() {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let pingTime = CACurrentMediaTime()
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async { sem.signal() }
+            let result = sem.wait(timeout: .now() + 2.0)
+            let elapsed = (CACurrentMediaTime() - pingTime) * 1000
+            if result == .timedOut {
+                dlog("STALL: main thread blocked >2000ms")
+                self.captureStallSample()
+            } else if elapsed > 200 {
+                dlog("STALL: main thread slow ms=\(String(format: "%.0f", elapsed))")
+            }
+        }
+        timer.resume()
+        stallDetectorTimer = timer
+    }
+
+    /// Auto-capture a process sample when the main thread is stalled.
+    /// 30-second cooldown to avoid spamming.
+    private func captureStallSample() {
+        let now = CACurrentMediaTime()
+        guard now - lastSampleTime > 30 else { return }
+        lastSampleTime = now
+
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let epoch = Int(Date().timeIntervalSince1970)
+        let outputPath = "/tmp/cmux-stall-\(epoch).txt"
+
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+            process.arguments = ["\(pid)", "1", "-file", outputPath]
+            do {
+                try process.run()
+                process.waitUntilExit()
+                dlog("STALL: sample captured → \(outputPath)")
+            } catch {
+                dlog("STALL: sample failed: \(error)")
+            }
+        }
+    }
+
     private static let initLogPath = "/tmp/cmux-ghostty-init.log"
 
     private static func initLog(_ message: String) {
@@ -831,8 +962,14 @@ class GhosttyApp {
         runtimeConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
         runtimeConfig.supports_selection_clipboard = true
         runtimeConfig.wakeup_cb = { userdata in
-            DispatchQueue.main.async {
-                GhosttyApp.shared.tick()
+            // Coalesce wakeups: only enqueue a tick if one isn't already pending.
+            // During output floods (e.g. cat 100MB), this collapses ~97K async
+            // dispatches into one-per-run-loop-cycle.
+            if !GhosttyApp.shared.setTickPendingIfNeeded() {
+                DispatchQueue.main.async {
+                    GhosttyApp.shared.isTickPending = false
+                    GhosttyApp.shared.tick()
+                }
             }
         }
         runtimeConfig.action_cb = { app, target, action in
@@ -1154,6 +1291,12 @@ class GhosttyApp {
         let start = CACurrentMediaTime()
         ghostty_app_tick(app)
         let elapsedMs = (CACurrentMediaTime() - start) * 1000
+
+        #if DEBUG
+        if elapsedMs > 16 {
+            dlog("tick.slow ms=\(String(format: "%.1f", elapsedMs))")
+        }
+        #endif
 
         // Track lag during scrolling
         if isScrolling {
@@ -1626,24 +1769,14 @@ class GhosttyApp {
             }
         case GHOSTTY_ACTION_SCROLLBAR:
             let scrollbar = GhosttyScrollbar(c: action.action.scrollbar)
-            surfaceView.scrollbar = scrollbar
-            NotificationCenter.default.post(
-                name: .ghosttyDidUpdateScrollbar,
-                object: surfaceView,
-                userInfo: [GhosttyNotificationKey.scrollbar: scrollbar]
-            )
+            surfaceView.scrollbarCoalescer.signal(scrollbar)
             return true
         case GHOSTTY_ACTION_CELL_SIZE:
             let cellSize = CGSize(
                 width: CGFloat(action.action.cell_size.width),
                 height: CGFloat(action.action.cell_size.height)
             )
-            surfaceView.cellSize = cellSize
-            NotificationCenter.default.post(
-                name: .ghosttyDidUpdateCellSize,
-                object: surfaceView,
-                userInfo: [GhosttyNotificationKey.cellSize: cellSize]
-            )
+            surfaceView.cellSizeCoalescer.signal(cellSize)
             return true
         case GHOSTTY_ACTION_START_SEARCH:
             guard let terminalSurface = surfaceView.terminalSurface else { return true }
@@ -1686,30 +1819,18 @@ class GhosttyApp {
                 .flatMap { String(cString: $0) } ?? ""
             if let tabId = surfaceView.tabId,
                let surfaceId = surfaceView.terminalSurface?.id {
-                DispatchQueue.main.async {
-                    NotificationCenter.default.post(
-                        name: .ghosttyDidSetTitle,
-                        object: surfaceView,
-                        userInfo: [
-                            GhosttyNotificationKey.tabId: tabId,
-                            GhosttyNotificationKey.surfaceId: surfaceId,
-                            GhosttyNotificationKey.title: title,
-                        ]
-                    )
-                }
+                surfaceView.titleCoalescer.signal([
+                    GhosttyNotificationKey.tabId: tabId,
+                    GhosttyNotificationKey.surfaceId: surfaceId,
+                    GhosttyNotificationKey.title: title,
+                ])
             }
             return true
         case GHOSTTY_ACTION_PWD:
             guard let tabId = surfaceView.tabId,
                   let surfaceId = surfaceView.terminalSurface?.id else { return true }
             let pwd = action.action.pwd.pwd.flatMap { String(cString: $0) } ?? ""
-            DispatchQueue.main.async {
-                AppDelegate.shared?.tabManager?.updateSurfaceDirectory(
-                    tabId: tabId,
-                    surfaceId: surfaceId,
-                    directory: pwd
-                )
-            }
+            surfaceView.pwdCoalescer.signal((tabId, surfaceId, pwd))
             return true
         case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
             guard let tabId = surfaceView.tabId else { return true }
@@ -2917,6 +3038,49 @@ class GhosttyNSView: NSView, NSUserInterfaceValidations {
     var desiredFocus: Bool = false
     var suppressingReparentFocus: Bool = false
     var tabId: UUID?
+
+    /// Coalesces SET_TITLE callbacks from the Ghostty IO thread so at most one
+    /// notification post reaches the main run loop per cycle during output floods.
+    lazy var titleCoalescer = ThreadSafeCallbackCoalescer<[AnyHashable: Any]> { [weak self] userInfo in
+        guard let self else { return }
+        NotificationCenter.default.post(
+            name: .ghosttyDidSetTitle,
+            object: self,
+            userInfo: userInfo
+        )
+    }
+
+    /// Coalesces scrollbar callbacks from the Ghostty IO thread during output floods.
+    lazy var scrollbarCoalescer = ThreadSafeCallbackCoalescer<GhosttyScrollbar> { [weak self] scrollbar in
+        guard let self else { return }
+        self.scrollbar = scrollbar
+        NotificationCenter.default.post(
+            name: .ghosttyDidUpdateScrollbar,
+            object: self,
+            userInfo: [GhosttyNotificationKey.scrollbar: scrollbar]
+        )
+    }
+
+    /// Coalesces cell size callbacks from the Ghostty IO thread during output floods.
+    lazy var cellSizeCoalescer = ThreadSafeCallbackCoalescer<CGSize> { [weak self] cellSize in
+        guard let self else { return }
+        self.cellSize = cellSize
+        NotificationCenter.default.post(
+            name: .ghosttyDidUpdateCellSize,
+            object: self,
+            userInfo: [GhosttyNotificationKey.cellSize: cellSize]
+        )
+    }
+
+    /// Coalesces PWD callbacks from the Ghostty IO thread during output floods.
+    lazy var pwdCoalescer = ThreadSafeCallbackCoalescer<(UUID, UUID, String)> { userInfo in
+        let (tabId, surfaceId, pwd) = userInfo
+        AppDelegate.shared?.tabManager?.updateSurfaceDirectory(
+            tabId: tabId,
+            surfaceId: surfaceId,
+            directory: pwd
+        )
+    }
     var onFocus: (() -> Void)?
     var onTriggerFlash: (() -> Void)?
     var backgroundColor: NSColor?
@@ -6560,10 +6724,13 @@ final class GhosttySurfaceScrollView: NSView {
         }
 
         if !isLiveScrolling {
-            let cellHeight = surfaceView.cellSize.height
-            if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
-                let offsetY =
-                    CGFloat(scrollbar.total - scrollbar.offset - scrollbar.len) * cellHeight
+            if let scrollbar = surfaceView.scrollbar, scrollbar.total > 0 {
+                // Use ratio-based scroll positioning so the capped document height
+                // doesn't break accuracy with large scrollback.
+                let scrollFraction = Double(scrollbar.total - scrollbar.offset - scrollbar.len)
+                    / Double(max(1, scrollbar.total))
+                let scrollableRange = max(0, targetDocumentHeight - scrollView.contentSize.height)
+                let offsetY = CGFloat(scrollFraction) * scrollableRange
                 let targetOrigin = CGPoint(x: 0, y: offsetY)
                 if !pointApproximatelyEqual(scrollView.contentView.bounds.origin, targetOrigin) {
                     scrollView.contentView.scroll(to: targetOrigin)
@@ -6583,17 +6750,17 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func handleLiveScroll() {
-        let cellHeight = surfaceView.cellSize.height
-        guard cellHeight > 0 else { return }
+        guard let scrollbar = surfaceView.scrollbar, scrollbar.total > 0 else { return }
 
         let visibleRect = scrollView.contentView.documentVisibleRect
-        let documentHeight = documentView.frame.height
-        let scrollOffset = documentHeight - visibleRect.origin.y - visibleRect.height
-        let row = Int(scrollOffset / cellHeight)
+        let docHeight = documentView.frame.height
+        let scrollableRange = max(1, docHeight - visibleRect.height)
+        let scrollFraction = visibleRect.origin.y / scrollableRange
+        let row = Int(Double(scrollbar.total) * (1.0 - scrollFraction) - Double(scrollbar.len))
 
         guard row != lastSentRow else { return }
         lastSentRow = row
-        _ = surfaceView.performBindingAction("scroll_to_row:\(row)")
+        _ = surfaceView.performBindingAction("scroll_to_row:\(max(0, row))")
     }
 
     private func handleScrollbarUpdate(_ notification: Notification) {
@@ -6604,13 +6771,21 @@ final class GhosttySurfaceScrollView: NSView {
         synchronizeScrollView()
     }
 
+    /// Cap document height to prevent AppKit scroll view performance degradation
+    /// with multi-million pixel tall documents. Scroll position uses ratio-based
+    /// calculation in synchronizeScrollView, so the cap doesn't affect accuracy.
+    private static let maxDocumentHeight: CGFloat = {
+        let val = UserDefaults.standard.integer(forKey: "scrollbackDocumentHeightLimit")
+        return val > 0 ? CGFloat(val) : .greatestFiniteMagnitude
+    }()
+
     private func documentHeight() -> CGFloat {
         let contentHeight = scrollView.contentSize.height
         let cellHeight = surfaceView.cellSize.height
         if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
             let documentGridHeight = CGFloat(scrollbar.total) * cellHeight
             let padding = contentHeight - (CGFloat(scrollbar.len) * cellHeight)
-            return documentGridHeight + padding
+            return min(documentGridHeight + padding, Self.maxDocumentHeight)
         }
         return contentHeight
     }
