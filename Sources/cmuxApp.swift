@@ -2844,6 +2844,7 @@ struct SettingsView: View {
     private var sendAnonymousTelemetry = TelemetrySettings.defaultSendAnonymousTelemetry
     @AppStorage("cmuxPortBase") private var cmuxPortBase = 9100
     @AppStorage("cmuxPortRange") private var cmuxPortRange = 10
+    @AppStorage("scrollbackDocumentHeightLimit") private var scrollbackDocumentHeightLimit = 10_000
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
     @AppStorage(BrowserSearchSettings.searchSuggestionsEnabledKey) private var browserSearchSuggestionsEnabled = BrowserSearchSettings.defaultSearchSuggestionsEnabled
     @AppStorage(BrowserThemeSettings.modeKey) private var browserThemeMode = BrowserThemeSettings.defaultMode.rawValue
@@ -3714,6 +3715,14 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardNote(String(localized: "settings.automation.port.note", defaultValue: "Each workspace gets CMUX_PORT and CMUX_PORT_END env vars with a dedicated port range. New terminals inherit these values."))
+                    }
+
+                    SettingsCard {
+                        SettingsCardRow(String(localized: "settings.automation.scrollDocHeight", defaultValue: "Scroll Document Height Limit"), subtitle: String(localized: "settings.automation.scrollDocHeight.subtitle", defaultValue: "Maximum virtual document height in points for the scroll view. Lower values improve performance with large output. Set to 0 for unlimited. Requires restart."), controlWidth: pickerColumnWidth) {
+                            TextField("", value: $scrollbackDocumentHeightLimit, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                        }
                     }
 
                     SettingsSectionHeader(title: String(localized: "settings.section.browser", defaultValue: "Browser"))

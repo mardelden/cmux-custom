@@ -72719,6 +72719,28 @@
           }
         }
       }
+    },
+    "settings.automation.scrollDocHeight": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scroll Document Height Limit"
+          }
+        }
+      }
+    },
+    "settings.automation.scrollDocHeight.subtitle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Maximum virtual document height in points for the scroll view. Lower values improve performance with large output. Set to 0 for unlimited. Requires restart."
+          }
+        }
+      }
     }
   }
 }

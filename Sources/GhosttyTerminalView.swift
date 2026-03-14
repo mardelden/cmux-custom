@@ -845,9 +845,65 @@ class GhosttyApp {
 
     private init() {
         initializeGhostty()
+        #if DEBUG
+        startStallDetector()
+        #endif
     }
 
     #if DEBUG
+    private var stallDetectorTimer: DispatchSourceTimer?
+    private var lastSampleTime: CFTimeInterval = 0
+
+    /// Background-thread watchdog that pings the main thread every 500ms.
+    /// Logs a warning when the main thread doesn't respond within 200ms,
+    /// catching freezes inside Ghostty C/Zig code or AppKit/Metal rendering
+    /// that our specific instrumentation points don't cover.
+    private func startStallDetector() {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let pingTime = CACurrentMediaTime()
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async { sem.signal() }
+            let result = sem.wait(timeout: .now() + 2.0)
+            let elapsed = (CACurrentMediaTime() - pingTime) * 1000
+            if result == .timedOut {
+                dlog("STALL: main thread blocked >2000ms")
+                self.captureStallSample()
+            } else if elapsed > 200 {
+                dlog("STALL: main thread slow ms=\(String(format: "%.0f", elapsed))")
+            }
+        }
+        timer.resume()
+        stallDetectorTimer = timer
+    }
+
+    /// Auto-capture a process sample when the main thread is stalled.
+    /// 30-second cooldown to avoid spamming.
+    private func captureStallSample() {
+        let now = CACurrentMediaTime()
+        guard now - lastSampleTime > 30 else { return }
+        lastSampleTime = now
+
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let epoch = Int(Date().timeIntervalSince1970)
+        let outputPath = "/tmp/cmux-stall-\(epoch).txt"
+
+        DispatchQueue.global(qos: .utility).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+            process.arguments = ["\(pid)", "1", "-file", outputPath]
+            do {
+                try process.run()
+                process.waitUntilExit()
+                dlog("STALL: sample captured → \(outputPath)")
+            } catch {
+                dlog("STALL: sample failed: \(error)")
+            }
+        }
+    }
+
     private static let initLogPath = "/tmp/cmux-ghostty-init.log"
 
     private static func initLog(_ message: String) {
@@ -1235,6 +1291,12 @@ class GhosttyApp {
         let start = CACurrentMediaTime()
         ghostty_app_tick(app)
         let elapsedMs = (CACurrentMediaTime() - start) * 1000
+
+        #if DEBUG
+        if elapsedMs > 16 {
+            dlog("tick.slow ms=\(String(format: "%.1f", elapsedMs))")
+        }
+        #endif
 
         // Track lag during scrolling
         if isScrolling {
@@ -6662,10 +6724,13 @@ final class GhosttySurfaceScrollView: NSView {
         }
 
         if !isLiveScrolling {
-            let cellHeight = surfaceView.cellSize.height
-            if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
-                let offsetY =
-                    CGFloat(scrollbar.total - scrollbar.offset - scrollbar.len) * cellHeight
+            if let scrollbar = surfaceView.scrollbar, scrollbar.total > 0 {
+                // Use ratio-based scroll positioning so the capped document height
+                // doesn't break accuracy with large scrollback.
+                let scrollFraction = Double(scrollbar.total - scrollbar.offset - scrollbar.len)
+                    / Double(max(1, scrollbar.total))
+                let scrollableRange = max(0, targetDocumentHeight - scrollView.contentSize.height)
+                let offsetY = CGFloat(scrollFraction) * scrollableRange
                 let targetOrigin = CGPoint(x: 0, y: offsetY)
                 if !pointApproximatelyEqual(scrollView.contentView.bounds.origin, targetOrigin) {
                     scrollView.contentView.scroll(to: targetOrigin)
@@ -6685,17 +6750,17 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func handleLiveScroll() {
-        let cellHeight = surfaceView.cellSize.height
-        guard cellHeight > 0 else { return }
+        guard let scrollbar = surfaceView.scrollbar, scrollbar.total > 0 else { return }
 
         let visibleRect = scrollView.contentView.documentVisibleRect
-        let documentHeight = documentView.frame.height
-        let scrollOffset = documentHeight - visibleRect.origin.y - visibleRect.height
-        let row = Int(scrollOffset / cellHeight)
+        let docHeight = documentView.frame.height
+        let scrollableRange = max(1, docHeight - visibleRect.height)
+        let scrollFraction = visibleRect.origin.y / scrollableRange
+        let row = Int(Double(scrollbar.total) * (1.0 - scrollFraction) - Double(scrollbar.len))
 
         guard row != lastSentRow else { return }
         lastSentRow = row
-        _ = surfaceView.performBindingAction("scroll_to_row:\(row)")
+        _ = surfaceView.performBindingAction("scroll_to_row:\(max(0, row))")
     }
 
     private func handleScrollbarUpdate(_ notification: Notification) {
@@ -6706,13 +6771,21 @@ final class GhosttySurfaceScrollView: NSView {
         synchronizeScrollView()
     }
 
+    /// Cap document height to prevent AppKit scroll view performance degradation
+    /// with multi-million pixel tall documents. Scroll position uses ratio-based
+    /// calculation in synchronizeScrollView, so the cap doesn't affect accuracy.
+    private static let maxDocumentHeight: CGFloat = {
+        let val = UserDefaults.standard.integer(forKey: "scrollbackDocumentHeightLimit")
+        return val > 0 ? CGFloat(val) : .greatestFiniteMagnitude
+    }()
+
     private func documentHeight() -> CGFloat {
         let contentHeight = scrollView.contentSize.height
         let cellHeight = surfaceView.cellSize.height
         if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
             let documentGridHeight = CGFloat(scrollbar.total) * cellHeight
             let padding = contentHeight - (CGFloat(scrollbar.len) * cellHeight)
-            return documentGridHeight + padding
+            return min(documentGridHeight + padding, Self.maxDocumentHeight)
         }
         return contentHeight
     }
