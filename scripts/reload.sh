@@ -163,6 +163,22 @@ if [[ -n "$TAG" ]]; then
   fi
 fi
 
+# Ensure GhosttyKit symlink points to the latest build.
+# If a local build exists and is newer than the current symlink target,
+# update the symlink. This handles both manual `zig build` and submodule
+# branch changes without resetting the submodule checkout.
+LOCAL_XCFW="$PWD/ghostty/macos/GhosttyKit.xcframework"
+CURRENT_LINK="$(readlink GhosttyKit.xcframework 2>/dev/null || true)"
+if [[ -d "$LOCAL_XCFW" ]]; then
+  if [[ "$CURRENT_LINK" != "$LOCAL_XCFW" && "$LOCAL_XCFW" -nt "$CURRENT_LINK" ]]; then
+    echo "==> Local GhosttyKit build is newer, updating symlink..."
+    ln -sfn "$LOCAL_XCFW" GhosttyKit.xcframework
+  fi
+elif [[ ! -e "GhosttyKit.xcframework" ]]; then
+  echo "==> GhosttyKit.xcframework not found. Run ./scripts/setup.sh first."
+  exit 1
+fi
+
 XCODEBUILD_ARGS=(
   -project GhosttyTabs.xcodeproj
   -scheme cmux

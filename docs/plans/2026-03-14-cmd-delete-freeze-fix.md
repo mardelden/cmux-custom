@@ -1,25 +1,14 @@
 # Fix: Terminal freeze on Cmd+Delete after huge single-line output
 
-**Status:** Root cause identified, fix pending
-**Branch:** `cmux-persistent-session-ids`
+**Status:** Fix implemented, testing
+**Branch:** `perf-optimizations` (cmux) + `fix-link-regex-stall` (ghostty submodule)
 **Date:** 2026-03-14
 
 ## Problem
 
 After `curl` returns a huge JSON blob (5M chars, no newlines), pressing **Cmd+Delete** freezes the terminal for 2+ minutes. Regular backspace and Option+backspace work fine.
 
-## Investigation
-
-### What we tried (did NOT help)
-- `setopt prompt_cr prompt_sp`
-- Disabling Starship prompt
-- Key timing instrumentation (confirmed `interpretKeyEvents` returns in 6ms)
-
-### What we built to diagnose
-- **Stall detector with auto-sampling:** When the main thread blocks >2s, automatically runs `/usr/bin/sample <pid> 1` and saves to `/tmp/cmux-stall-<epoch>.txt`. 30-second cooldown.
-- **IO callback coalescer:** `ThreadSafeCallbackCoalescer<T>` collapses rapid-fire IO thread callbacks into one main-thread dispatch per run-loop cycle. Independently valuable optimization.
-
-### Root cause (from `/usr/bin/sample` stack trace)
+## Root cause
 
 ```
 flagsChanged → Surface.linkAtPin → onig_search → search_in_range → match_at → onigenc_step_back
@@ -30,31 +19,43 @@ When Cmd is released after Cmd+Delete, `flagsChanged` fires. Ghostty calls `link
 2. Runs Oniguruma regex on the full string for URL detection
 3. Regex engine takes minutes on a 5M-char string
 
-The fix belongs in `ghostty/src/Surface.zig` → `linkAtPin()` function. The link detection should be limited to visible text only, not the entire logical line.
+## Fix
 
-## Fix approach
+**File:** `ghostty/src/Surface.zig` → `linkAtPin()` (line ~4514)
 
-Modify `linkAtPin` in the Ghostty submodule (`ghostty/src/Surface.zig`, line 4469) to limit the text passed to regex. Options:
-1. **Clamp selection to visible columns** — only extract/regex the visible portion of the line
-2. **Length guard** — skip regex if the extracted string exceeds a threshold (e.g., 10K chars)
-3. **Both** — clamp to visible + length guard as safety net
+Added a length guard: skip regex if the extracted line exceeds 10K chars. No clickable URL exists in such lines.
 
-Option 1 is the correct fix since no one interacts with URLs in the non-visible portion of a line.
+```zig
+if (str_len > 10_000) return null;
+```
 
-## Related changes (keep)
+**Ghostty branch:** `fix-link-regex-stall` on `mardelden/ghostty-custom`
+**Commit:** `1246c4e76`
+
+### Merging checklist
+
+After testing is verified:
+1. Push ghostty branch: `cd ghostty && git push origin fix-link-regex-stall`
+2. Merge to fork main: `git checkout main && git merge fix-link-regex-stall && git push origin main`
+3. **Update submodule pointer in cmux-custom:** `cd .. && git add ghostty && git commit -m "Update ghostty submodule — fix link regex stall"`
+
+## Investigation summary
+
+### What we tried (did NOT help)
+- `setopt prompt_cr prompt_sp`
+- Disabling Starship prompt
+- Key timing instrumentation (confirmed `interpretKeyEvents` returns in 6ms)
+
+### What we built to diagnose
+- **Stall detector with auto-sampling:** captures `/usr/bin/sample` when main thread blocks >2s
+- **IO callback coalescer:** collapses rapid-fire IO callbacks into one main-thread dispatch per cycle
+
+## Related changes (committed on `perf-optimizations`)
 
 | Change | File | Rationale |
 |--------|------|-----------|
 | Stall detector + auto-sample | `GhosttyTerminalView.swift` | Reusable diagnostic tool |
 | IO callback coalescer | `GhosttyTerminalView.swift` | Independent perf optimization |
-| `maxDocumentHeight` cap | `GhosttyTerminalView.swift` | Prevents AppKit scroll perf issues |
+| `maxDocumentHeight` cap (configurable) | `GhosttyTerminalView.swift` + `cmuxApp.swift` | Prevents AppKit scroll perf issues |
 | Ratio-based scroll positioning | `GhosttyTerminalView.swift` | Fixes scroll accuracy with capped doc height |
-| `tick.slow` timing log | `GhosttyTerminalView.swift` | Lightweight, useful for perf debugging |
-
-## Related changes (discard)
-
-| Change | Rationale |
-|--------|-----------|
-| `key.surfaceKey.slow` timing (ctrl + keyDown paths) | Confirmed key sending is fast, not needed |
-| `key.interpretKeyEvents.slow` + mods logging | Same — confirmed not the bottleneck |
-| `scroll.sync.slow` timing | Investigation-only instrumentation |
+| `tick.slow` timing log | `GhosttyTerminalView.swift` | Lightweight perf debugging |

@@ -163,34 +163,53 @@ This makes it visible in the GitHub PR UI (Commits tab, check statuses) that the
 
 ## Ghostty submodule workflow
 
-Ghostty changes must be committed in the `ghostty` submodule and pushed to the `manaflow-ai/ghostty` fork.
+Ghostty changes must be committed in the `ghostty` submodule and pushed to the `mardelden/ghostty-custom` fork.
 Keep `docs/ghostty-fork.md` up to date with any fork changes and conflict notes.
 
+### Scripts
+
+- **`setup.sh`** — Run once on initial clone. Builds GhosttyKit, caches by SHA, creates symlink. Also run after resetting to a clean submodule state.
+- **`reload.sh`** — Auto-detects if the local GhosttyKit build is newer than the symlink target and updates it. Never resets the submodule checkout.
+
+### Development workflow (iterating on ghostty changes)
+
 ```bash
 cd ghostty
-git remote -v  # origin = upstream, manaflow = fork
 git checkout -b <branch>
-git add <files>
-git commit -m "..."
-git push manaflow <branch>
+# ... make changes ...
+git add <files> && git commit -m "..."
+
+# Rebuild GhosttyKit (reload.sh will pick up the new build automatically)
+zig build -Demit-xcframework=true -Doptimize=ReleaseFast
+
+# Build and launch cmux with the updated framework
+cd .. && ./scripts/reload.sh --tag <tag>
 ```
 
-To keep the fork up to date with upstream:
+### IMPORTANT: Update submodule pointer after merging
+
+After ghostty changes are tested and merged to the fork's main, **always update the submodule pointer in cmux-custom**:
 
 ```bash
 cd ghostty
-git fetch origin
-git checkout main
-git merge origin/main
-git push manaflow main
-```
-
-Then update the parent repo with the new submodule SHA:
-
-```bash
+git checkout main && git merge <branch> && git push origin main
 cd ..
 git add ghostty
-git commit -m "Update ghostty submodule"
+git commit -m "Update ghostty submodule — <description>"
+```
+
+Forgetting this step means other developers (and CI) will build with the old ghostty version.
+
+### Syncing fork with upstream ghostty
+
+```bash
+cd ghostty
+git remote add upstream https://github.com/ghostty-org/ghostty.git  # if not already added
+git fetch upstream
+git checkout main
+git merge upstream/main
+git push origin main
+cd .. && git add ghostty && git commit -m "Sync ghostty submodule with upstream"
 ```
 
 ## Release
