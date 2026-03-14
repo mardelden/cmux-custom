@@ -9,6 +9,7 @@ NAME_SET=0
 BUNDLE_SET=0
 DERIVED_SET=0
 TAG=""
+INSTALL=0
 
 usage() {
   cat <<'EOF'
@@ -23,6 +24,7 @@ Options:
   --name <app name>      Override app display/bundle name.
   --bundle-id <id>       Override bundle identifier.
   --derived-data <path>  Override derived data path.
+  --install              Copy the built app to /Applications after build.
   -h, --help             Show this help.
 EOF
 }
@@ -83,6 +85,10 @@ while [[ $# -gt 0 ]]; do
       fi
       DERIVED_SET=1
       shift 2
+      ;;
+    --install)
+      INSTALL=1
+      shift
       ;;
     -h|--help)
       usage
@@ -271,4 +277,12 @@ if [[ "${#PIDS[@]}" -gt 1 ]]; then
       kill "$PID" 2>/dev/null || true
     fi
   done
+fi
+
+if [[ "$INSTALL" -eq 1 ]]; then
+  INSTALL_PATH="/Applications/${APP_NAME}.app"
+  echo "Installing to ${INSTALL_PATH}..."
+  rm -rf "$INSTALL_PATH"
+  cp -R "$APP_PATH" "$INSTALL_PATH"
+  echo "Installed: ${INSTALL_PATH}"
 fi

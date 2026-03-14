@@ -2096,9 +2096,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
         context: ghostty_surface_context_e,
         configTemplate: ghostty_surface_config_s?,
         workingDirectory: String? = nil,
-        additionalEnvironment: [String: String] = [:]
+        additionalEnvironment: [String: String] = [:],
+        restoredId: UUID? = nil
     ) {
-        self.id = UUID()
+        self.id = restoredId ?? UUID()
         self.tabId = tabId
         self.surfaceContext = context
         self.configTemplate = configTemplate

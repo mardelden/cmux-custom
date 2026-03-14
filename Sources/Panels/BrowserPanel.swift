@@ -1588,8 +1588,8 @@ final class BrowserPanel: Panel, ObservableObject {
         setupObservers(for: webView)
     }
 
-    init(workspaceId: UUID, initialURL: URL? = nil, bypassInsecureHTTPHostOnce: String? = nil) {
-        self.id = UUID()
+    init(workspaceId: UUID, initialURL: URL? = nil, bypassInsecureHTTPHostOnce: String? = nil, restoredId: UUID? = nil) {
+        self.id = restoredId ?? UUID()
         self.workspaceId = workspaceId
         self.insecureHTTPBypassHostOnce = BrowserInsecureHTTPSettings.normalizeHost(bypassInsecureHTTPHostOnce ?? "")
         self.browserThemeMode = BrowserThemeSettings.mode()
