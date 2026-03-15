@@ -2845,6 +2845,9 @@ struct SettingsView: View {
     @AppStorage("cmuxPortBase") private var cmuxPortBase = 9100
     @AppStorage("cmuxPortRange") private var cmuxPortRange = 10
     @AppStorage("scrollbackDocumentHeightLimit") private var scrollbackDocumentHeightLimit = 10_000
+    @AppStorage("collapseOutputThreshold") private var collapseOutputThreshold = 20
+    @AppStorage("collapseOutputHeadLines") private var collapseOutputHeadLines = 3
+    @AppStorage("collapseOutputTailLines") private var collapseOutputTailLines = 3
     @AppStorage(BrowserSearchSettings.searchEngineKey) private var browserSearchEngine = BrowserSearchSettings.defaultSearchEngine.rawValue
     @AppStorage(BrowserSearchSettings.searchSuggestionsEnabledKey) private var browserSearchSuggestionsEnabled = BrowserSearchSettings.defaultSearchSuggestionsEnabled
     @AppStorage(BrowserThemeSettings.modeKey) private var browserThemeMode = BrowserThemeSettings.defaultMode.rawValue
@@ -3720,6 +3723,30 @@ struct SettingsView: View {
                     SettingsCard {
                         SettingsCardRow(String(localized: "settings.automation.scrollDocHeight", defaultValue: "Scroll Document Height Limit"), subtitle: String(localized: "settings.automation.scrollDocHeight.subtitle", defaultValue: "Maximum virtual document height in points for the scroll view. Lower values improve performance with large output. Set to 0 for unlimited. Requires restart."), controlWidth: pickerColumnWidth) {
                             TextField("", value: $scrollbackDocumentHeightLimit, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+
+                    SettingsCard {
+                        SettingsCardRow(String(localized: "settings.fold.threshold", defaultValue: "Output Fold Threshold"), subtitle: String(localized: "settings.fold.threshold.subtitle", defaultValue: "Minimum output lines before auto-folding. Set to 0 to disable folding."), controlWidth: pickerColumnWidth) {
+                            TextField("", value: $collapseOutputThreshold, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(String(localized: "settings.fold.headLines", defaultValue: "Fold Head Lines"), subtitle: String(localized: "settings.fold.headLines.subtitle", defaultValue: "Lines to keep visible before the fold."), controlWidth: pickerColumnWidth) {
+                            TextField("", value: $collapseOutputHeadLines, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(String(localized: "settings.fold.tailLines", defaultValue: "Fold Tail Lines"), subtitle: String(localized: "settings.fold.tailLines.subtitle", defaultValue: "Lines to keep visible after the fold."), controlWidth: pickerColumnWidth) {
+                            TextField("", value: $collapseOutputTailLines, format: .number)
                                 .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                         }

@@ -1122,6 +1122,11 @@ void* ghostty_surface_quicklook_font(ghostty_surface_t);
 bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 
+// Fold/unfold rows for auto-collapsing large output
+void ghostty_surface_fold_rows(ghostty_surface_t, uint64_t start_row, uint64_t end_row);
+void ghostty_surface_unfold_rows(ghostty_surface_t, uint64_t start_row, uint64_t end_row);
+void ghostty_surface_unfold_all(ghostty_surface_t);
+
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
 void ghostty_inspector_free(ghostty_surface_t);
 void ghostty_inspector_set_focus(ghostty_inspector_t, bool);

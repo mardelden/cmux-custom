@@ -1023,6 +1023,68 @@ class cmux:
             params["label"] = label
         return dict(self._call("debug.window.screenshot", params) or {})
 
+    def list_folds(self, surface: Union[str, int, None] = None) -> list:
+        params: Dict[str, Any] = {}
+        if surface is not None:
+            params["surface_id"] = self._resolve_surface_id(surface)
+        res = self._call("debug.fold.list", params) or {}
+        return list(res.get("folds") or [])
+
+    def add_fold(
+        self,
+        start_row: int,
+        end_row: int,
+        surface: Union[str, int, None] = None,
+        total_output_lines: Optional[int] = None,
+    ) -> dict:
+        params: Dict[str, Any] = {"start_row": start_row, "end_row": end_row}
+        if surface is not None:
+            params["surface_id"] = self._resolve_surface_id(surface)
+        if total_output_lines is not None:
+            params["total_output_lines"] = total_output_lines
+        return dict(self._call("debug.fold.add", params) or {})
+
+    def remove_fold(
+        self,
+        *,
+        fold_id: Optional[str] = None,
+        start_row: Optional[int] = None,
+        end_row: Optional[int] = None,
+        surface: Union[str, int, None] = None,
+    ) -> dict:
+        params: Dict[str, Any] = {}
+        if surface is not None:
+            params["surface_id"] = self._resolve_surface_id(surface)
+        if fold_id is not None:
+            params["fold_id"] = fold_id
+        if start_row is not None:
+            params["start_row"] = start_row
+        if end_row is not None:
+            params["end_row"] = end_row
+        return dict(self._call("debug.fold.remove", params) or {})
+
+    def clear_folds(self, surface: Union[str, int, None] = None) -> dict:
+        params: Dict[str, Any] = {}
+        if surface is not None:
+            params["surface_id"] = self._resolve_surface_id(surface)
+        return dict(self._call("debug.fold.clear", params) or {})
+
+    def get_fold_settings(self) -> dict:
+        return dict(self._call("debug.fold.get_settings") or {})
+
+    def set_fold_settings(self, *, threshold: int = None, head_lines: int = None, tail_lines: int = None) -> dict:
+        params: Dict[str, Any] = {}
+        if threshold is not None:
+            params["threshold"] = threshold
+        if head_lines is not None:
+            params["head_lines"] = head_lines
+        if tail_lines is not None:
+            params["tail_lines"] = tail_lines
+        return dict(self._call("debug.fold.set_settings", params) or {})
+
+    def send_text(self, text: str) -> None:
+        self.send(text)
+
 
 def main() -> None:
     import argparse

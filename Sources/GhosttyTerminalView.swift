@@ -2132,6 +2132,46 @@ final class TerminalSurface: Identifiable, ObservableObject {
         }
     }
 
+    /// State for a single auto-collapsed command output fold region.
+    final class FoldRegionState: Identifiable, ObservableObject {
+        let id = UUID()
+        /// Physical row where fold begins (absolute row index)
+        let foldStartRow: UInt64
+        /// Physical row where fold ends (exclusive)
+        let foldEndRow: UInt64
+        /// Total output lines from the command
+        let totalOutputLines: Int
+        /// Currently folded line count
+        @Published var foldedLines: Int
+        /// Number of folded rows
+        var size: UInt64 { foldEndRow - foldStartRow }
+
+        init(foldStartRow: UInt64, foldEndRow: UInt64, totalOutputLines: Int) {
+            self.foldStartRow = foldStartRow
+            self.foldEndRow = foldEndRow
+            self.totalOutputLines = totalOutputLines
+            self.foldedLines = Int(foldEndRow - foldStartRow)
+        }
+    }
+
+    /// Absolute cursor row recorded at command start (for detecting large output)
+    var cmdStartAbsoluteCursorRow: UInt64?
+
+    /// Number of lines the shell prompt occupies.
+    /// Auto-learned from "empty enter" cycles (precmd without intervening preexec).
+    /// Used to skip prompt lines when computing head lines for output folding.
+    var promptLineCount: Int = 1
+
+    /// Tracks whether reportCmdStart fired between consecutive reportCmdEnd calls.
+    /// When false at reportCmdEnd time, outputLines == prompt height (no command ran).
+    var cmdDidRun: Bool = false
+
+    /// Active fold regions (multiple folds accumulate across commands)
+    @Published var foldRegions: [FoldRegionState] = []
+
+    /// Maximum number of simultaneous fold regions
+    static let maxFoldRegions = 50
+
     private(set) var surface: ghostty_surface_t?
     private weak var attachedView: GhosttyNSView?
     /// Whether the terminal surface view is currently attached to a window.
@@ -5082,6 +5122,8 @@ final class GhosttySurfaceScrollView: NSView {
     private let keyboardCopyModeBadgeLabel: NSTextField
     private var searchOverlayHostingView: NSHostingView<SurfaceSearchOverlay>?
     private var lastSearchOverlayStateID: ObjectIdentifier?
+    private var foldIndicatorViews: [UUID: NSView] = [:]
+    private var foldRegionsSubscription: AnyCancellable?
     private var observers: [NSObjectProtocol] = []
 	    private var windowObservers: [NSObjectProtocol] = []
 	    private var isLiveScrolling = false
@@ -5601,8 +5643,21 @@ final class GhosttySurfaceScrollView: NSView {
         if window.isKeyWindow { applyFirstResponderIfNeeded() }
     }
 
+    /// The current scrollbar state from the inner surface view.
+    var scrollbar: GhosttyScrollbar? {
+        surfaceView.scrollbar
+    }
+
     func attachSurface(_ terminalSurface: TerminalSurface) {
         surfaceView.attachSurface(terminalSurface)
+
+        // Subscribe to fold region changes on the terminal surface
+        foldRegionsSubscription = nil
+        foldRegionsSubscription = terminalSurface.$foldRegions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.updateFoldIndicators()
+            }
     }
 
     func setFocusHandler(_ handler: (() -> Void)?) {
@@ -5780,6 +5835,221 @@ final class GhosttySurfaceScrollView: NSView {
             } else {
                 addSubview(keyboardCopyModeBadgeView, positioned: .above, relativeTo: nil)
             }
+        }
+    }
+
+    /// Updates inline fold indicator views to match current fold regions and viewport.
+    func updateFoldIndicators() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateFoldIndicators()
+            }
+            return
+        }
+
+        guard let terminalSurface = surfaceView.terminalSurface,
+              let scrollbar = surfaceView.scrollbar,
+              scrollbar.total > 0 else {
+            // No surface or scrollbar — remove all indicators
+            for (_, view) in foldIndicatorViews {
+                view.removeFromSuperview()
+            }
+            foldIndicatorViews.removeAll()
+            return
+        }
+
+        let regions = terminalSurface.foldRegions
+        let cellHeightPixels = surfaceView.cellSize.height
+        guard cellHeightPixels > 0 else { return }
+
+        // cellSize from Ghostty is in pixels; convert to points for AppKit layout
+        let scaleFactor = window?.backingScaleFactor ?? 2.0
+        let cellHeight = cellHeightPixels / scaleFactor
+        let indicatorHeight = cellHeight + 8  // 1 cell + 4pt top/bottom padding
+
+        // scrollbar.offset and scrollbar.total are in fold-adjusted (visual) space.
+        // foldStartRow/foldEndRow are in absolute (physical) row space.
+        // Convert fold positions to visual space for correct positioning.
+        let visualViewportTop: Int
+        if isLiveScrolling {
+            let visibleRect = scrollView.contentView.documentVisibleRect
+            let docHeight = documentView.frame.height
+            let scrollableRange = max(1, docHeight - visibleRect.height)
+            let scrollFraction = visibleRect.origin.y / scrollableRange
+            let row = Double(scrollbar.total) * (1.0 - scrollFraction) - Double(scrollbar.len)
+            visualViewportTop = max(0, Int(row))
+        } else {
+            visualViewportTop = Int(scrollbar.offset)
+        }
+        let viewportRows = Int(scrollbar.len)
+        let visualViewportEnd = visualViewportTop + viewportRows
+
+        #if DEBUG
+        dlog("fold.indicator visualViewportTop=\(visualViewportTop) visualViewportEnd=\(visualViewportEnd) scrollbar=(offset=\(scrollbar.offset) total=\(scrollbar.total) len=\(scrollbar.len)) regions=\(regions.count) bounds=\(bounds.height)x\(bounds.width) cellHeight=\(cellHeight)")
+        #endif
+
+        // Track which region IDs are currently active
+        var activeIDs = Set<UUID>()
+
+        for region in regions {
+            let foldAbsStart = Int(region.foldStartRow)
+            let foldAbsEnd = Int(region.foldEndRow)
+
+            // Convert fold start from absolute to visual space by subtracting
+            // all earlier folds' sizes (they remove rows from the visual display).
+            var visualFoldStart = foldAbsStart
+            for earlier in regions {
+                let earlierStart = Int(earlier.foldStartRow)
+                let earlierEnd = Int(earlier.foldEndRow)
+                guard earlierStart < foldAbsStart else { break }
+                // Subtract the portion of this earlier fold that's before our fold start
+                let foldSize = min(earlierEnd, foldAbsStart) - earlierStart
+                visualFoldStart -= max(0, foldSize)
+            }
+
+            // Position relative to viewport
+            let visualPos = visualFoldStart - visualViewportTop
+
+            // Skip if fold is outside the viewport
+            guard visualPos >= 0 && visualPos < viewportRows else {
+                #if DEBUG
+                dlog("fold.indicator SKIP region foldStart=\(foldAbsStart) foldEnd=\(foldAbsEnd) visualFoldStart=\(visualFoldStart) visualPos=\(visualPos) outside viewport [\(visualViewportTop)..\(visualViewportEnd))")
+                #endif
+                if let view = foldIndicatorViews.removeValue(forKey: region.id) {
+                    view.removeFromSuperview()
+                }
+                continue
+            }
+
+            #if DEBUG
+            dlog("fold.indicator SHOW region foldStart=\(foldAbsStart) foldEnd=\(foldAbsEnd) visualFoldStart=\(visualFoldStart) visualPos=\(visualPos) viewportRows=\(viewportRows)")
+            #endif
+
+            activeIDs.insert(region.id)
+
+            // Convert to pixel Y (AppKit: origin at bottom-left)
+            let pixelYFromTop = CGFloat(visualPos) * cellHeight
+            let flippedY = bounds.height - pixelYFromTop - indicatorHeight
+
+            let targetFrame = CGRect(
+                x: 0,
+                y: flippedY,
+                width: bounds.width,
+                height: indicatorHeight
+            )
+
+            if let existingView = foldIndicatorViews[region.id] {
+                // Update position
+                existingView.frame = targetFrame
+            } else {
+                // Create new indicator
+                let regionId = region.id
+                let indicator = InlineFoldIndicator(
+                    foldedLines: region.foldedLines
+                )
+                let hostingView = FoldIndicatorHostingView(rootView: indicator)
+                hostingView.frame = targetFrame
+                hostingView.scrollTarget = surfaceView
+                hostingView.onExpand = { [weak terminalSurface] in
+                    guard let surface = terminalSurface,
+                          let ghosttySurface = surface.surface else { return }
+                    ghostty_surface_unfold_rows(ghosttySurface, region.foldStartRow, region.foldEndRow)
+                    surface.foldRegions.removeAll { $0.id == regionId }
+                }
+                // Insert below search overlay in z-order
+                if let searchOverlay = searchOverlayHostingView {
+                    addSubview(hostingView, positioned: .below, relativeTo: searchOverlay)
+                } else {
+                    addSubview(hostingView)
+                }
+                foldIndicatorViews[region.id] = hostingView
+            }
+        }
+
+        // Remove indicators for regions that no longer exist
+        for (id, view) in foldIndicatorViews where !activeIDs.contains(id) {
+            view.removeFromSuperview()
+            foldIndicatorViews.removeValue(forKey: id)
+        }
+    }
+
+    /// NSHostingView subclass that forwards scroll events to the terminal surface,
+    /// preventing the fold indicator bar from blocking terminal scrolling.
+    private final class FoldIndicatorHostingView<Content: View>: NSHostingView<Content> {
+        weak var scrollTarget: NSView?
+        var onExpand: (() -> Void)?
+
+        // Track mouseDown to distinguish click (expand) from drag (selection).
+        private var mouseDownEvent: NSEvent?
+        private var isDragging = false
+
+        override func mouseDown(with event: NSEvent) {
+            isDragging = false
+            mouseDownEvent = event
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            if !isDragging {
+                isDragging = true
+                // Forward the original mouseDown to start selection
+                if let downEvent = mouseDownEvent {
+                    scrollTarget?.mouseDown(with: downEvent)
+                }
+            }
+            scrollTarget?.mouseDragged(with: event)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            if isDragging {
+                scrollTarget?.mouseUp(with: event)
+            } else {
+                // Click without drag — expand the fold
+                onExpand?()
+            }
+            isDragging = false
+            mouseDownEvent = nil
+        }
+
+        override func scrollWheel(with event: NSEvent) {
+            (scrollTarget ?? superview)?.scrollWheel(with: event)
+        }
+
+        private var trackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let existing = trackingArea {
+                removeTrackingArea(existing)
+            }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeInActiveApp],
+                owner: self
+            )
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        private var cursorPushed = false
+
+        override func mouseEntered(with event: NSEvent) {
+            NSCursor.pointingHand.push()
+            cursorPushed = true
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            if cursorPushed {
+                NSCursor.pop()
+                cursorPushed = false
+            }
+        }
+
+        override func removeFromSuperview() {
+            if cursorPushed {
+                NSCursor.pop()
+                cursorPushed = false
+            }
+            super.removeFromSuperview()
         }
     }
 
@@ -6727,7 +6997,10 @@ final class GhosttySurfaceScrollView: NSView {
             if let scrollbar = surfaceView.scrollbar, scrollbar.total > 0 {
                 // Use ratio-based scroll positioning so the capped document height
                 // doesn't break accuracy with large scrollback.
-                let scrollFraction = Double(scrollbar.total - scrollbar.offset - scrollbar.len)
+                // Use signed arithmetic to avoid UInt64 underflow when folds
+                // shrink scrollbar.total below offset + len temporarily.
+                let scrollNumerator = max(0, Int64(scrollbar.total) - Int64(scrollbar.offset) - Int64(scrollbar.len))
+                let scrollFraction = Double(scrollNumerator)
                     / Double(max(1, scrollbar.total))
                 let scrollableRange = max(0, targetDocumentHeight - scrollView.contentSize.height)
                 let offsetY = CGFloat(scrollFraction) * scrollableRange
@@ -6743,10 +7016,13 @@ final class GhosttySurfaceScrollView: NSView {
         if didChangeGeometry {
             scrollView.reflectScrolledClipView(scrollView.contentView)
         }
+
+        updateFoldIndicators()
     }
 
     private func handleScrollChange() {
         synchronizeSurfaceView()
+        updateFoldIndicators()
     }
 
     private func handleLiveScroll() {
@@ -6758,9 +7034,15 @@ final class GhosttySurfaceScrollView: NSView {
         let scrollFraction = visibleRect.origin.y / scrollableRange
         let row = Int(Double(scrollbar.total) * (1.0 - scrollFraction) - Double(scrollbar.len))
 
-        guard row != lastSentRow else { return }
-        lastSentRow = row
-        _ = surfaceView.performBindingAction("scroll_to_row:\(max(0, row))")
+        if row != lastSentRow {
+            lastSentRow = row
+            _ = surfaceView.performBindingAction("scroll_to_row:\(max(0, row))")
+        }
+
+        // Reposition fold indicators on every live scroll frame so they
+        // track the visual scroll position without waiting for Ghostty's
+        // async scrollbar update.
+        updateFoldIndicators()
     }
 
     private func handleScrollbarUpdate(_ notification: Notification) {
@@ -6785,7 +7067,11 @@ final class GhosttySurfaceScrollView: NSView {
         if cellHeight > 0, let scrollbar = surfaceView.scrollbar {
             let documentGridHeight = CGFloat(scrollbar.total) * cellHeight
             let padding = contentHeight - (CGFloat(scrollbar.len) * cellHeight)
-            return min(documentGridHeight + padding, Self.maxDocumentHeight)
+            // When folds reduce scrollbar.total below scrollbar.len, the
+            // document grid is shorter than the viewport. Clamp to at least
+            // contentHeight so the scroll view doesn't collapse.
+            let height = documentGridHeight + padding
+            return min(max(height, contentHeight), Self.maxDocumentHeight)
         }
         return contentHeight
     }

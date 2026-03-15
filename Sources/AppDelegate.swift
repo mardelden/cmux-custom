@@ -1635,6 +1635,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     override init() {
         super.init()
         Self.shared = self
+
+        // Register fold setting defaults early so UserDefaults reads return
+        // correct values even if shell integration fires before
+        // applicationDidFinishLaunching completes.
+        UserDefaults.standard.register(defaults: [
+            "collapseOutputThreshold": 20,
+            "collapseOutputHeadLines": 3,
+            "collapseOutputTailLines": 3,
+        ])
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
