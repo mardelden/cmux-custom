@@ -204,9 +204,22 @@ _cmux_preexec() {
     _cmux_report_tty_once
     _cmux_ports_kick
     _cmux_start_git_head_watch
+
+    # Notify app that a command is starting (for auto-collapse output detection)
+    {
+        _cmux_send "report_cmd_start --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
+    } >/dev/null 2>&1 &!
 }
 
 _cmux_precmd() {
+    # Ensure we run last among precmd hooks so the baseline cursor position
+    # includes output from other precmd hooks (e.g., iterm2_precmd blank line).
+    # Reorder on first invocation; takes effect from the next precmd cycle.
+    if [[ -z "$_CMUX_PRECMD_REORDERED" ]] && (( ${#precmd_functions} > 1 )); then
+        _CMUX_PRECMD_REORDERED=1
+        precmd_functions=(${precmd_functions:#_cmux_precmd} _cmux_precmd)
+    fi
+
     _cmux_stop_git_head_watch
 
     # Skip if socket doesn't exist yet
@@ -222,6 +235,13 @@ _cmux_precmd() {
     fi
 
     _cmux_report_tty_once
+
+    # Notify app that a command finished (for auto-collapse output detection).
+    # Count lines in $PROMPT so the app can skip prompt rows in head calculation.
+    local -i _cmux_pl=${#${(f)"$(print -nP -- "$PROMPT")"}}
+    {
+        _cmux_send "report_cmd_end --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID --prompt-lines=$_cmux_pl"
+    } >/dev/null 2>&1 &!
 
     local now=$EPOCHSECONDS
     local pwd="$PWD"
@@ -396,6 +416,7 @@ _cmux_precmd() {
     if (( cmd_dur >= 2 || now - _CMUX_PORTS_LAST_RUN >= 10 )); then
         _cmux_ports_kick
     fi
+
 }
 
 # Ensure Resources/bin is at the front of PATH, and remove the app's

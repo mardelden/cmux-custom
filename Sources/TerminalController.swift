@@ -1468,6 +1468,17 @@ class TerminalController {
         case "read_screen":
             return readScreenText(args)
 
+        case "report_cmd_start":
+            #if DEBUG
+            dlog("fold.DISPATCH report_cmd_start args=\(args)")
+            #endif
+            return reportCmdStart(args)
+
+        case "report_cmd_end":
+            #if DEBUG
+            dlog("fold.DISPATCH report_cmd_end args=\(args)")
+            #endif
+            return reportCmdEnd(args)
 
 #if DEBUG
         case "send_workspace":
@@ -2052,6 +2063,18 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPanelSnapshotReset(params: params))
         case "debug.window.screenshot":
             return v2Result(id: id, self.v2DebugScreenshot(params: params))
+        case "debug.fold.list":
+            return v2Result(id: id, self.v2DebugFoldList(params: params))
+        case "debug.fold.add":
+            return v2Result(id: id, self.v2DebugFoldAdd(params: params))
+        case "debug.fold.remove":
+            return v2Result(id: id, self.v2DebugFoldRemove(params: params))
+        case "debug.fold.clear":
+            return v2Result(id: id, self.v2DebugFoldClear(params: params))
+        case "debug.fold.get_settings":
+            return v2Result(id: id, self.v2DebugFoldGetSettings(params: params))
+        case "debug.fold.set_settings":
+            return v2Result(id: id, self.v2DebugFoldSetSettings(params: params))
 #endif
 
         default:
@@ -2248,6 +2271,12 @@ class TerminalController {
             "debug.panel_snapshot",
             "debug.panel_snapshot.reset",
             "debug.window.screenshot",
+            "debug.fold.list",
+            "debug.fold.add",
+            "debug.fold.remove",
+            "debug.fold.clear",
+            "debug.fold.get_settings",
+            "debug.fold.set_settings",
         ])
 #endif
 
@@ -9396,6 +9425,235 @@ class TerminalController {
             "path": parts[1]
         ])
     }
+
+    // MARK: - Debug Fold Commands
+
+    private func v2DebugFoldList(params: [String: Any]) -> V2CallResult {
+        var result: V2CallResult = .err(code: "internal_error", message: "Unexpected", data: nil)
+        v2MainSync {
+            guard let tabManager = v2ResolveTabManager(params: params) else {
+                result = .err(code: "unavailable", message: "TabManager not available", data: nil)
+                return
+            }
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId: UUID?
+            if let explicit = v2UUID(params, "surface_id") {
+                surfaceId = explicit
+            } else {
+                surfaceId = ws.focusedPanelId
+            }
+            guard let sid = surfaceId,
+                  let terminalPanel = ws.terminalPanel(for: sid) else {
+                result = .err(code: "not_found", message: "No focused terminal surface", data: nil)
+                return
+            }
+            let surface = terminalPanel.surface
+            let folds: [[String: Any]] = surface.foldRegions.map { region in
+                [
+                    "id": region.id.uuidString,
+                    "start_row": region.foldStartRow,
+                    "end_row": region.foldEndRow,
+                    "folded_lines": region.foldedLines,
+                    "total_output_lines": region.totalOutputLines,
+                    "size": region.size,
+                ]
+            }
+            result = .ok(["folds": folds, "count": folds.count])
+        }
+        return result
+    }
+
+    private func v2DebugFoldAdd(params: [String: Any]) -> V2CallResult {
+        guard let startRow = v2Int(params, "start_row") else {
+            return .err(code: "invalid_params", message: "Missing start_row", data: nil)
+        }
+        guard let endRow = v2Int(params, "end_row") else {
+            return .err(code: "invalid_params", message: "Missing end_row", data: nil)
+        }
+        guard endRow > startRow else {
+            return .err(code: "invalid_params", message: "end_row must be greater than start_row", data: nil)
+        }
+        let totalOutputLines = v2Int(params, "total_output_lines") ?? (endRow - startRow)
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Unexpected", data: nil)
+        v2MainSync {
+            guard let tabManager = v2ResolveTabManager(params: params) else {
+                result = .err(code: "unavailable", message: "TabManager not available", data: nil)
+                return
+            }
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId: UUID?
+            if let explicit = v2UUID(params, "surface_id") {
+                surfaceId = explicit
+            } else {
+                surfaceId = ws.focusedPanelId
+            }
+            guard let sid = surfaceId,
+                  let terminalPanel = ws.terminalPanel(for: sid) else {
+                result = .err(code: "not_found", message: "No focused terminal surface", data: nil)
+                return
+            }
+            let surface = terminalPanel.surface
+            let foldStart = UInt64(startRow)
+            let foldEnd = UInt64(endRow)
+
+            // Enforce max fold regions — evict oldest if at capacity
+            if surface.foldRegions.count >= TerminalSurface.maxFoldRegions,
+               let oldest = surface.foldRegions.first {
+                if let ghosttySurface = surface.surface {
+                    ghostty_surface_unfold_rows(ghosttySurface, oldest.foldStartRow, oldest.foldEndRow)
+                }
+                surface.foldRegions.removeFirst()
+            }
+
+            // Call Ghostty C API to fold the rows
+            if let ghosttySurface = surface.surface {
+                ghostty_surface_fold_rows(ghosttySurface, foldStart, foldEnd)
+            }
+
+            let newRegion = TerminalSurface.FoldRegionState(
+                foldStartRow: foldStart,
+                foldEndRow: foldEnd,
+                totalOutputLines: totalOutputLines
+            )
+            surface.foldRegions.append(newRegion)
+
+            result = .ok([
+                "fold_id": newRegion.id.uuidString,
+                "start_row": foldStart,
+                "end_row": foldEnd,
+                "folded_lines": newRegion.foldedLines,
+                "total_folds": surface.foldRegions.count,
+            ])
+        }
+        return result
+    }
+
+    private func v2DebugFoldRemove(params: [String: Any]) -> V2CallResult {
+        var result: V2CallResult = .err(code: "internal_error", message: "Unexpected", data: nil)
+        v2MainSync {
+            guard let tabManager = v2ResolveTabManager(params: params) else {
+                result = .err(code: "unavailable", message: "TabManager not available", data: nil)
+                return
+            }
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId: UUID?
+            if let explicit = v2UUID(params, "surface_id") {
+                surfaceId = explicit
+            } else {
+                surfaceId = ws.focusedPanelId
+            }
+            guard let sid = surfaceId,
+                  let terminalPanel = ws.terminalPanel(for: sid) else {
+                result = .err(code: "not_found", message: "No focused terminal surface", data: nil)
+                return
+            }
+            let surface = terminalPanel.surface
+
+            // Find the fold region by fold_id or by start_row+end_row
+            let region: TerminalSurface.FoldRegionState?
+            if let foldIdStr = v2String(params, "fold_id"),
+               let foldId = UUID(uuidString: foldIdStr) {
+                region = surface.foldRegions.first { $0.id == foldId }
+            } else if let startRow = v2Int(params, "start_row"),
+                      let endRow = v2Int(params, "end_row") {
+                let start = UInt64(startRow)
+                let end = UInt64(endRow)
+                region = surface.foldRegions.first { $0.foldStartRow == start && $0.foldEndRow == end }
+            } else {
+                result = .err(code: "invalid_params", message: "Provide fold_id or start_row+end_row", data: nil)
+                return
+            }
+
+            guard let found = region else {
+                result = .err(code: "not_found", message: "Fold region not found", data: nil)
+                return
+            }
+
+            // Unfold in Ghostty and remove from array
+            if let ghosttySurface = surface.surface {
+                ghostty_surface_unfold_rows(ghosttySurface, found.foldStartRow, found.foldEndRow)
+            }
+            let removedId = found.id.uuidString
+            surface.foldRegions.removeAll { $0.id == found.id }
+
+            result = .ok([
+                "removed_fold_id": removedId,
+                "remaining_folds": surface.foldRegions.count,
+            ])
+        }
+        return result
+    }
+
+    private func v2DebugFoldClear(params: [String: Any]) -> V2CallResult {
+        var result: V2CallResult = .err(code: "internal_error", message: "Unexpected", data: nil)
+        v2MainSync {
+            guard let tabManager = v2ResolveTabManager(params: params) else {
+                result = .err(code: "unavailable", message: "TabManager not available", data: nil)
+                return
+            }
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId: UUID?
+            if let explicit = v2UUID(params, "surface_id") {
+                surfaceId = explicit
+            } else {
+                surfaceId = ws.focusedPanelId
+            }
+            guard let sid = surfaceId,
+                  let terminalPanel = ws.terminalPanel(for: sid) else {
+                result = .err(code: "not_found", message: "No focused terminal surface", data: nil)
+                return
+            }
+            let surface = terminalPanel.surface
+            let removedCount = surface.foldRegions.count
+
+            // Unfold all in Ghostty
+            if let ghosttySurface = surface.surface {
+                ghostty_surface_unfold_all(ghosttySurface)
+            }
+            surface.foldRegions.removeAll()
+
+            result = .ok(["removed_count": removedCount])
+        }
+        return result
+    }
+
+    private func v2DebugFoldGetSettings(params: [String: Any]) -> V2CallResult {
+        return .ok([
+            "threshold": UserDefaults.standard.integer(forKey: "collapseOutputThreshold"),
+            "head_lines": UserDefaults.standard.integer(forKey: "collapseOutputHeadLines"),
+            "tail_lines": UserDefaults.standard.integer(forKey: "collapseOutputTailLines"),
+        ])
+    }
+
+    private func v2DebugFoldSetSettings(params: [String: Any]) -> V2CallResult {
+        if let threshold = v2Int(params, "threshold") {
+            UserDefaults.standard.set(threshold, forKey: "collapseOutputThreshold")
+        }
+        if let headLines = v2Int(params, "head_lines") {
+            UserDefaults.standard.set(headLines, forKey: "collapseOutputHeadLines")
+        }
+        if let tailLines = v2Int(params, "tail_lines") {
+            UserDefaults.standard.set(tailLines, forKey: "collapseOutputTailLines")
+        }
+        return .ok([
+            "threshold": UserDefaults.standard.integer(forKey: "collapseOutputThreshold"),
+            "head_lines": UserDefaults.standard.integer(forKey: "collapseOutputHeadLines"),
+            "tail_lines": UserDefaults.standard.integer(forKey: "collapseOutputTailLines"),
+        ])
+    }
 #endif
 
     private struct ReadScreenOptions {
@@ -13467,6 +13725,219 @@ class TerminalController {
             tabManager.updateSurfaceDirectory(tabId: tab.id, surfaceId: surfaceId, directory: directory)
         }
         return result
+    }
+
+    // MARK: - Auto-collapse output (fold regions)
+
+    /// Called at preexec time (command is about to run). Just marks the surface
+    /// as having a running command. Does NOT read scrollbar (async timing makes
+    /// it unreliable). The baseline is recorded by reportCmdEnd at precmd time.
+    private func reportCmdStart(_ args: String) -> String {
+        let parsed = parseOptions(args)
+        #if DEBUG
+        dlog("fold.cmdStart args=\(args) thread=\(Thread.isMainThread ? "main" : "bg")")
+        #endif
+
+        if let scope = Self.explicitSocketScope(options: parsed.options) {
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: scope.workspaceId),
+                      let tab = tabManager.tabs.first(where: { $0.id == scope.workspaceId }),
+                      let panel = tab.panels[scope.panelId] as? TerminalPanel else {
+                    #if DEBUG
+                    dlog("fold.cmdStart FAILED tab/panel lookup scope=\(scope)")
+                    #endif
+                    return
+                }
+
+                // Mark that a command is about to run. reportCmdEnd uses this
+                // to distinguish "command produced output" from "empty enter"
+                // (precmd without preexec), which lets us auto-learn prompt height.
+                panel.surface.cmdDidRun = true
+
+                #if DEBUG
+                dlog("fold.cmdStart OK surface=\(panel.surface.id) cmdDidRun=true promptLines=\(panel.surface.promptLineCount)")
+                #endif
+            }
+            return "OK"
+        }
+
+        #if DEBUG
+        dlog("fold.cmdStart FAILED no scope")
+        #endif
+        return "ERROR: Missing --tab/--panel"
+    }
+
+    /// Called at precmd time (command finished, prompt about to display).
+    /// Clears any previous fold, calculates output line count from baseline,
+    /// folds if above threshold, and saves current scrollbar total as baseline
+    /// for the next command.
+    private func reportCmdEnd(_ args: String) -> String {
+        let parsed = parseOptions(args)
+        let effectiveThreshold = UserDefaults.standard.integer(forKey: "collapseOutputThreshold")
+        #if DEBUG
+        dlog("fold.cmdEnd args=\(args) threshold=\(effectiveThreshold)")
+        #endif
+
+        // 0 means disabled explicitly
+        if effectiveThreshold == 0 {
+            #if DEBUG
+            dlog("fold.cmdEnd DISABLED by user (threshold=0)")
+            #endif
+            return "OK"
+        }
+
+        if let scope = Self.explicitSocketScope(options: parsed.options) {
+            DispatchQueue.main.async {
+                guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: scope.workspaceId),
+                      let tab = tabManager.tabs.first(where: { $0.id == scope.workspaceId }),
+                      let panel = tab.panels[scope.panelId] as? TerminalPanel else {
+                    #if DEBUG
+                    dlog("fold.cmdEnd FAILED tab/panel lookup scope=\(scope)")
+                    #endif
+                    return
+                }
+
+                let surface = panel.surface
+
+                guard let currentScrollbar = surface.hostedView.scrollbar else {
+                    #if DEBUG
+                    dlog("fold.cmdEnd FAILED no current scrollbar")
+                    #endif
+                    return
+                }
+
+                // scrollbar.total is fold-adjusted (reduced by existing folds).
+                // Convert back to physical row space so baselines are consistent.
+                let existingFoldedRows = surface.foldRegions.reduce(UInt64(0)) { $0 + $1.size }
+                let endTotal = currentScrollbar.total + existingFoldedRows
+
+                // Get cursor screen row from IME point to compute absolute cursor position.
+                // This works even when output fits within the viewport (where scrollbar.total
+                // stays equal to viewport height and can't detect output).
+                var imeX: Double = 0, imeY: Double = 0, imeW: Double = 0, imeH: Double = 0
+                if let ghosttySurface = surface.surface {
+                    ghostty_surface_ime_point(ghosttySurface, &imeX, &imeY, &imeW, &imeH)
+                }
+                let cursorScreenRow: UInt64
+                if imeH > 0 {
+                    cursorScreenRow = UInt64(max(0, Int(floor(imeY / imeH)) - 1))
+                } else {
+                    cursorScreenRow = 0
+                }
+                let absoluteCursorRow = (endTotal - UInt64(currentScrollbar.len)) + cursorScreenRow
+
+                // If no baseline yet (first precmd after shell init), just save it
+                guard let baselineCursorRow = surface.cmdStartAbsoluteCursorRow else {
+                    surface.cmdStartAbsoluteCursorRow = absoluteCursorRow
+                    #if DEBUG
+                    dlog("fold.cmdEnd first precmd — saved baseline=\(absoluteCursorRow) (endTotal=\(endTotal) cursorScreen=\(cursorScreenRow) foldAdj=\(existingFoldedRows))")
+                    #endif
+                    return
+                }
+
+                let outputLines = Int(absoluteCursorRow) - Int(baselineCursorRow)
+
+                // Use shell-reported prompt line count if available.
+                // The shell counts lines in $PROMPT at precmd time.
+                let shellPromptLines: Int
+                if let plStr = parsed.options["prompt-lines"], let pl = Int(plStr), pl > 0 {
+                    shellPromptLines = pl
+                } else {
+                    shellPromptLines = 1
+                }
+
+                // Auto-learn prompt height from empty-enter cycles (fallback).
+                // When preexec didn't fire, outputLines == total prompt height.
+                let didRunCommand = surface.cmdDidRun
+                surface.cmdDidRun = false
+                if !didRunCommand && outputLines > 0 && outputLines <= 15 {
+                    surface.promptLineCount = outputLines
+                    #if DEBUG
+                    dlog("fold.cmdEnd LEARNED promptLines=\(outputLines) from empty-enter cycle")
+                    #endif
+                }
+
+                // Use max of shell-reported and learned prompt height.
+                // Shell reports $PROMPT lines; learned value captures precmd output too.
+                let effectivePromptLines = max(shellPromptLines, surface.promptLineCount)
+
+                #if DEBUG
+                dlog("fold.cmdEnd baselineCursor=\(baselineCursorRow) absoluteCursor=\(absoluteCursorRow) (endTotal=\(endTotal) cursorScreen=\(cursorScreenRow) foldAdj=\(existingFoldedRows)) outputLines=\(outputLines) cmdRan=\(didRunCommand) shellPrompt=\(shellPromptLines) learnedPrompt=\(surface.promptLineCount) effectivePrompt=\(effectivePromptLines) threshold=\(effectiveThreshold)")
+                #endif
+
+                // Save current cursor position as baseline for the next command
+                surface.cmdStartAbsoluteCursorRow = absoluteCursorRow
+
+                guard didRunCommand && outputLines > effectiveThreshold else {
+                    #if DEBUG
+                    if !didRunCommand {
+                        dlog("fold.cmdEnd SKIP no command ran (empty enter)")
+                    } else {
+                        dlog("fold.cmdEnd SKIP outputLines(\(outputLines)) <= threshold(\(effectiveThreshold))")
+                    }
+                    #endif
+                    return
+                }
+
+                // Head/tail lines to keep visible around the fold
+                let headLines = max(0, UserDefaults.standard.integer(forKey: "collapseOutputHeadLines"))
+                let tailLines = max(0, UserDefaults.standard.integer(forKey: "collapseOutputTailLines"))
+
+                // Skip prompt lines so headLines counts actual output lines only.
+                let promptOffset = UInt64(effectivePromptLines)
+                let foldStartRow = baselineCursorRow + promptOffset + UInt64(min(headLines, outputLines))
+                let foldEndRow = absoluteCursorRow - UInt64(min(tailLines, outputLines))
+
+                guard foldEndRow > foldStartRow else {
+                    #if DEBUG
+                    dlog("fold.cmdEnd SKIP foldEnd(\(foldEndRow)) <= foldStart(\(foldStartRow)) head=\(headLines) tail=\(tailLines)")
+                    #endif
+                    return
+                }
+
+                #if DEBUG
+                dlog("fold.cmdEnd FOLDING rows \(foldStartRow)..\(foldEndRow) (\(foldEndRow - foldStartRow) rows)")
+                #endif
+
+                // Enforce max fold regions — evict oldest if at capacity
+                if surface.foldRegions.count >= TerminalSurface.maxFoldRegions,
+                   let oldest = surface.foldRegions.first {
+                    if let ghosttySurface = surface.surface {
+                        ghostty_surface_unfold_rows(ghosttySurface, oldest.foldStartRow, oldest.foldEndRow)
+                    }
+                    surface.foldRegions.removeFirst()
+                    #if DEBUG
+                    dlog("fold.cmdEnd evicted oldest fold \(oldest.foldStartRow)..\(oldest.foldEndRow)")
+                    #endif
+                }
+
+                // Call Ghostty C API to fold the rows
+                if let ghosttySurface = surface.surface {
+                    ghostty_surface_fold_rows(ghosttySurface, foldStartRow, foldEndRow)
+                } else {
+                    #if DEBUG
+                    dlog("fold.cmdEnd FAILED no ghostty surface")
+                    #endif
+                }
+
+                // Append the new fold region
+                let newRegion = TerminalSurface.FoldRegionState(
+                    foldStartRow: foldStartRow,
+                    foldEndRow: foldEndRow,
+                    totalOutputLines: outputLines
+                )
+                surface.foldRegions.append(newRegion)
+                #if DEBUG
+                dlog("fold.cmdEnd region appended foldedLines=\(newRegion.foldedLines) totalRegions=\(surface.foldRegions.count)")
+                #endif
+            }
+            return "OK"
+        }
+
+        #if DEBUG
+        dlog("fold.cmdEnd FAILED no scope")
+        #endif
+        return "ERROR: Missing --tab/--panel"
     }
 
     private func clearPorts(_ args: String) -> String {

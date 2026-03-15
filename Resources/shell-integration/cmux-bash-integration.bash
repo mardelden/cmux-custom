@@ -120,6 +120,24 @@ _cmux_prompt_command() {
     [[ -n "$CMUX_TAB_ID" ]] || return 0
     [[ -n "$CMUX_PANEL_ID" ]] || return 0
 
+    # Notify app that a command finished (for auto-collapse output detection).
+    # Only send if we recorded a cmd_start (skip first prompt after shell init).
+    if [[ "${_CMUX_CMD_RUNNING:-0}" == "1" ]]; then
+        _CMUX_CMD_RUNNING=0
+        # Count prompt lines from PS1 for fold head offset
+        local _cmux_pl
+        _cmux_pl=$(echo -n "${PS1@P}" 2>/dev/null | grep -c $'\n')
+        ((_cmux_pl++))
+        {
+            _cmux_send "report_cmd_end --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID --prompt-lines=$_cmux_pl"
+        } >/dev/null 2>&1 & disown
+    fi
+    # Notify app that the next command is starting (for auto-collapse output detection)
+    {
+        _cmux_send "report_cmd_start --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
+    } >/dev/null 2>&1 & disown
+    _CMUX_CMD_RUNNING=1
+
     local now=$SECONDS
     local pwd="$PWD"
 
