@@ -154,11 +154,13 @@ This makes it visible in the GitHub PR UI (Commits tab, check statuses) that the
 
 ## Testing policy
 
-**Never run tests locally.** All tests (E2E, UI, python socket tests) run via GitHub Actions or on the VM.
+When working on a feature or bug fix, always create dedicated tests for that specific work and run them locally. This catches regressions early and validates the fix automatically.
 
-- **E2E / UI tests:** trigger via `gh workflow run test-e2e.yml` (see cmuxterm-hq CLAUDE.md for details)
-- **Unit tests:** `xcodebuild -scheme cmux-unit` is safe (no app launch), but prefer CI
-- **Python socket tests (tests_v2/):** these connect to a running cmux instance's socket. Never launch an untagged `cmux DEV.app` to run them. If you must test locally, use a tagged build's socket (`/tmp/cmux-debug-<tag>.sock`) with `CMUX_SOCKET=/tmp/cmux-debug-<tag>.sock`
+- **Feature/fix tests:** Create targeted tests (unit, socket, or zig) for the specific behavior you're changing. Run these locally during development.
+- **Full test suite:** Only run the full test suite when explicitly requested. Do not run all tests on every change.
+- **Unit tests:** `xcodebuild -scheme cmux-unit` (no app launch needed)
+- **Ghostty/zig tests:** `cd ghostty && zig build test -Dtest-filter="<filter>"`
+- **Python socket tests (tests_v2/):** these connect to a running cmux instance's socket. Use a tagged build's socket (`/tmp/cmux-debug-<tag>.sock`) with `CMUX_SOCKET=/tmp/cmux-debug-<tag>.sock`
 - **Never `open` an untagged `cmux DEV.app`** from DerivedData. It conflicts with the user's running debug instance.
 
 ## Ghostty submodule workflow
