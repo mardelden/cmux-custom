@@ -129,6 +129,15 @@ This makes it visible in the GitHub PR UI (Commits tab, check statuses) that the
 - **Terminal find layering contract:** `SurfaceSearchOverlay` must be mounted from `GhosttySurfaceScrollView` in `Sources/GhosttyTerminalView.swift` (AppKit portal layer), not from SwiftUI panel containers such as `Sources/Panels/TerminalPanelView.swift`. Portal-hosted terminal views can sit above SwiftUI during split/workspace churn.
 - **Submodule safety:** When modifying a submodule (ghostty, vendor/bonsplit, etc.), always push the submodule commit to its remote `main` branch BEFORE committing the updated pointer in the parent repo. Never commit on a detached HEAD or temporary branch — the commit will be orphaned and lost. Verify with: `cd <submodule> && git merge-base --is-ancestor HEAD origin/main`.
 - **All user-facing strings must be localized.** Use `String(localized: "key.name", defaultValue: "English text")` for every string shown in the UI (labels, buttons, menus, dialogs, tooltips, error messages). Keys go in `Resources/Localizable.xcstrings` with translations for all supported languages (currently English and Japanese). Never use bare string literals in SwiftUI `Text()`, `Button()`, alert titles, etc.
+- **Terminal fold coordinate spaces:** Ghostty uses three coordinate spaces — absolute/physical (scrollback rows), visual/fold-adjusted (what the user sees), and viewport-relative. Never mix them without conversion. See `memory/fold-implementation.md` for details.
+- **Pixel vs Points in Ghostty:** `cellSize` from Ghostty is in pixels (GPU renderer). AppKit bounds/frames are in points. Always divide by `backingScaleFactor` for AppKit coordinates.
+- **NSView overlay mouse events:** NSHostingView overlays steal mouse events from the terminal. Distinguish click from drag at the NSView level (not SwiftUI). Forward drag events to the terminal for selection. Pop cursor in `removeFromSuperview()` since `mouseExited` won't fire on view removal.
+
+## Plans
+
+Implementation plans are stored in `plans/` as markdown files. Reference these for architectural context on past decisions. Existing plans also live in `docs/plans/` (older format with date prefixes).
+
+Before implementing any plan, make sure we capture it in `plans/` through creating new ones or updating existing ones.
 
 ## Test quality policy
 
